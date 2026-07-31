@@ -506,11 +506,20 @@ const Client = struct {
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
+    /// Classifies this client's input stream chunk by chunk (persistent VT
+    /// parser state), so a mouse report split across socket reads is still
+    /// recognized as a mouse report — see Daemon.handleInput.
+    classifier: util.InputClassifier = .{},
+    /// Bytes of an escape sequence whose tail hasn't arrived yet, held back so
+    /// the session only ever receives whole sequences. Bounded by
+    /// MAX_INPUT_CARRY; an overflow is discarded as junk.
+    input_carry: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *Client) void {
         posix.close(self.socket_fd);
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
+        self.input_carry.deinit(self.alloc);
     }
 };
 
@@ -1031,18 +1040,67 @@ const Daemon = struct {
         };
     }
 
+    /// An escape sequence is at most a few dozen bytes; a "partial sequence"
+    /// larger than this is junk (or a paste of raw escapes), not a mouse report
+    /// worth reassembling.
+    const MAX_INPUT_CARRY = 128;
+
+    fn flushInputCarry(self: *Daemon, client: *Client) void {
+        if (client.input_carry.items.len == 0) return;
+        self.queuePtyInput(client.input_carry.items);
+        client.input_carry.clearRetainingCapacity();
+    }
+
     pub fn handleInput(self: *Daemon, client: *Client, payload: []const u8) !void {
         std.log.debug("buffering pty input data={x}", .{payload});
+        // Classified for every chunk, leader included: the classifier can only
+        // recognize a sequence that splits across reads if it sees the client's
+        // whole stream in order.
+        const class = client.classifier.classify(payload);
+
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
+            self.flushInputCarry(client);
             self.queuePtyInput(payload);
             return;
         }
 
-        // check if leader needs to be updated by detecting any user input
-        if (util.isUserInput(payload)) {
+        // Keyboard input claims leadership, exactly as before.
+        if (class.keyboard) {
             try self.setLeader(client);
+            self.flushInputCarry(client);
             self.queuePtyInput(payload);
+            return;
+        }
+
+        // Mouse input is forwarded without the leadership dance: a second
+        // attached client scrolling should scroll, not be silently dropped.
+        // (Upstream excluded mouse from isUserInput so it wouldn't *switch
+        // leaders*, and dropping was the side effect.) Only whole sequences are
+        // forwarded: a report still missing its tail waits in input_carry, so
+        // the session never receives a bare tail like "5;90;20M" as text —
+        // which is exactly what used to leak into a TUI's composer.
+        const complete_end = class.tail_start orelse payload.len;
+        if (class.mouse) {
+            self.flushInputCarry(client);
+            if (complete_end > 0) self.queuePtyInput(payload[0..complete_end]);
+        } else if (complete_end > 0) {
+            // Completed non-mouse, non-keyboard sequences (focus events,
+            // terminal replies) are dropped for a non-leader as before — along
+            // with any held-back head they turn out to complete. A chunk that
+            // completes nothing (complete_end == 0) is pure continuation and
+            // leaves the carry to grow below.
+            client.input_carry.clearRetainingCapacity();
+        }
+        if (class.tail_start) |tail_index| {
+            const partial = payload[tail_index..];
+            if (client.input_carry.items.len + partial.len <= MAX_INPUT_CARRY) {
+                client.input_carry.appendSlice(client.alloc, partial) catch {
+                    client.input_carry.clearRetainingCapacity();
+                };
+            } else {
+                client.input_carry.clearRetainingCapacity();
+            }
         }
     }
 
@@ -3152,4 +3210,90 @@ fn ignoreSigpipe() void {
         .flags = 0,
     };
     posix.sigaction(posix.SIG.PIPE, &act, null);
+}
+
+test "non-leader mouse input is forwarded without a leadership switch" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .alloc = alloc,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = undefined,
+    };
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(&client, "\x1b[<64;10;10M");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[<64;10;10M", daemon.pty_write_buf.items);
+}
+
+test "non-leader split mouse report is reassembled, never a bare tail" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .alloc = alloc,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = undefined,
+    };
+    defer client.input_carry.deinit(alloc);
+
+    // Head chunk: nothing reaches the PTY, the head waits in carry.
+    try daemon.handleInput(&client, "\x1b[<6");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+    // Tail chunk: the whole report arrives at once.
+    try daemon.handleInput(&client, "5;90;20M");
+    try std.testing.expectEqualStrings("\x1b[<65;90;20M", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+}
+
+test "non-leader focus events are still dropped" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .alloc = alloc,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = undefined,
+    };
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(&client, "\x1b[I");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
 }

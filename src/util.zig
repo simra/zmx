@@ -562,6 +562,98 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
+/// Stateful sibling of `isUserInput`, for classifying one client's input stream
+/// chunk by chunk. `isUserInput` starts a fresh parser per chunk, which misreads
+/// a chunk that *begins* mid-sequence: the tail of a split SGR mouse report
+/// (`5;90;20M`) parses as printable text, so it was both typed into the session
+/// and treated as a leadership claim. Keeping the parser (and the X10 raw-byte
+/// countdown) across chunks makes a split report classify as what it is.
+///
+/// The caller owns one classifier per client and must feed it every input chunk
+/// of that client's stream, in order, or the parser state diverges from the
+/// stream and the classification is garbage.
+pub const InputClassifier = struct {
+    parser: ghostty_vt.Parser = ghostty_vt.Parser.init(),
+    /// Raw bytes still owed to an X10-style `CSI M` report, whose button/x/y
+    /// arrive as three bare bytes the VT grammar would otherwise call text.
+    pending_mouse_bytes: u8 = 0,
+
+    pub const Class = struct {
+        /// Intentional keys: printable text, enter/backspace/tab, kitty-protocol
+        /// and modified keys. What claims leadership, same rules as `isUserInput`.
+        keyboard: bool = false,
+        /// Mouse reports — SGR (`CSI < ... M/m`) or X10 (`CSI M` + 3 raw bytes).
+        mouse: bool = false,
+        /// Index where a sequence begins that this chunk does not finish, or
+        /// null if the chunk ends on a sequence boundary. The caller holds
+        /// these bytes back so the session only ever receives whole sequences.
+        tail_start: ?usize = null,
+    };
+
+    pub fn classify(self: *InputClassifier, payload: []const u8) Class {
+        var class = Class{};
+        // A chunk that starts mid-sequence is a continuation: its unfinished
+        // head began at 0 as far as holding bytes back is concerned.
+        var seq_start: ?usize = if (self.parser.state != .ground) 0 else null;
+        var i: usize = 0;
+        while (i < payload.len) {
+            if (self.pending_mouse_bytes > 0) {
+                // X10 coordinate bytes ride outside the VT grammar — count them
+                // as mouse and keep them away from the parser, which would call
+                // them printable.
+                self.pending_mouse_bytes -= 1;
+                class.mouse = true;
+                i += 1;
+                continue;
+            }
+            if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
+                if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
+                    if (kitty.event_type != 3) class.keyboard = true;
+                    // Feed the sequence through the parser anyway so its state
+                    // stays in step with the stream.
+                    const end = i + 2 + kitty.consumed;
+                    while (i < end) : (i += 1) _ = self.parser.next(payload[i]);
+                    seq_start = null;
+                    continue;
+                }
+            }
+            if (self.parser.state == .ground and payload[i] == 0x1b) seq_start = i;
+            const actions = self.parser.next(payload[i]);
+            for (actions) |action_opt| {
+                const action = action_opt orelse continue;
+                switch (action) {
+                    .print => class.keyboard = true,
+                    .csi_dispatch => |csi| {
+                        if (csi.final == 'u' or csi.final == '~') {
+                            class.keyboard = true;
+                        } else if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) {
+                            class.keyboard = true;
+                        } else if (csi.final == 'M' or csi.final == 'm') {
+                            class.mouse = true;
+                            // Bare `CSI M` is the X10 encoding: three raw
+                            // coordinate bytes follow.
+                            if (csi.final == 'M' and csi.params.len == 0) {
+                                self.pending_mouse_bytes = 3;
+                            }
+                        }
+                        // Focus in/out (I/O), terminal replies, and everything
+                        // else: neither — the caller drops them for a non-leader.
+                    },
+                    .execute => |code| {
+                        if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08)
+                            class.keyboard = true;
+                    },
+                    else => {},
+                }
+            }
+            if (self.parser.state == .ground) seq_start = null;
+            i += 1;
+        }
+        class.tail_start = seq_start;
+        return class;
+    }
+};
+
 /// Detect if the payload contains user input that should be printed to the screen or
 /// is a key combination like up-arrow, backspace, enter, ctrl+f, etc.
 pub fn isUserInput(payload: []const u8) bool {
@@ -1689,4 +1781,76 @@ test "stripAnsi: only escape sequences" {
     const result = try stripAnsi(alloc, "\x1b[31m\x1b[1m\x1b[0m");
     defer alloc.free(result);
     try testing.expectEqualStrings("", result);
+}
+
+test "classifyInput: complete SGR wheel report is mouse, not keyboard" {
+    var c = InputClassifier{};
+    const class = c.classify("\x1b[<64;90;20M");
+    try testing.expect(class.mouse);
+    try testing.expect(!class.keyboard);
+    try testing.expect(class.tail_start == null);
+}
+
+test "classifyInput: report split across chunks stays mouse and reports its tail" {
+    var c = InputClassifier{};
+    const first = c.classify("\x1b[<6");
+    try testing.expect(!first.keyboard);
+    try testing.expect(!first.mouse);
+    try testing.expectEqual(@as(?usize, 0), first.tail_start);
+    // The tail alone would read as printable text to a fresh parser — the
+    // stateful classifier knows it is the rest of a mouse report.
+    const second = c.classify("5;90;20M");
+    try testing.expect(second.mouse);
+    try testing.expect(!second.keyboard);
+    try testing.expect(second.tail_start == null);
+}
+
+test "classifyInput: typed text is keyboard" {
+    var c = InputClassifier{};
+    const class = c.classify("hello");
+    try testing.expect(class.keyboard);
+    try testing.expect(!class.mouse);
+}
+
+test "classifyInput: wheel report plus a keystroke reports both" {
+    var c = InputClassifier{};
+    const class = c.classify("\x1b[<64;10;10Mx");
+    try testing.expect(class.mouse);
+    try testing.expect(class.keyboard);
+}
+
+test "classifyInput: X10 report's raw coordinate bytes are not keyboard" {
+    var c = InputClassifier{};
+    const class = c.classify("\x1b[M !!");
+    try testing.expect(class.mouse);
+    try testing.expect(!class.keyboard);
+}
+
+test "classifyInput: X10 raw bytes split across chunks are still mouse" {
+    var c = InputClassifier{};
+    const first = c.classify("\x1b[M ");
+    try testing.expect(first.mouse);
+    try testing.expect(!first.keyboard);
+    const second = c.classify("!!");
+    try testing.expect(second.mouse);
+    try testing.expect(!second.keyboard);
+}
+
+test "classifyInput: focus events are neither keyboard nor mouse" {
+    var c = InputClassifier{};
+    const class = c.classify("\x1b[I\x1b[O");
+    try testing.expect(!class.mouse);
+    try testing.expect(!class.keyboard);
+    try testing.expect(class.tail_start == null);
+}
+
+test "classifyInput: mid-sequence chunk is all tail" {
+    var c = InputClassifier{};
+    _ = c.classify("\x1b[<6");
+    const cont = c.classify("4;9");
+    try testing.expect(!cont.keyboard);
+    try testing.expect(!cont.mouse);
+    try testing.expectEqual(@as(?usize, 0), cont.tail_start);
+    const fin = c.classify("0;20M");
+    try testing.expect(fin.mouse);
 }
