@@ -1253,19 +1253,37 @@ const Daemon = struct {
 
     pub fn handleKill(self: *Daemon) void {
         std.log.info("kill received session={s}", .{self.session_name});
+        // The shell runs with job control on, which puts whatever it launched in its
+        // own process group — so signalling the shell's group below never reaches the
+        // guest. A guest that handles SIGHUP (any TUI does) would outlive its session
+        // as an orphan, since the SIGKILL escalation only ever targeted the shell's
+        // group. Read the foreground group off the PTY before shutdown, and give it
+        // the same HUP-then-KILL treatment.
+        const fg_pgrp: posix.pid_t = cross.c.tcgetpgrp(self.pty_fd);
+        const fg_is_own_group = fg_pgrp > 0 and fg_pgrp != self.pid;
         self.shutdown();
         // gracefully shutdown shell processes, shells tend to ignore SIGTERM so we send SIGHUP
         // instead
         //   https://www.gnu.org/software/bash/manual/html_node/Signals.html
         // negative pid means kill process and children
-        std.log.info("sending SIGHUP session={s} pid={d}", .{ self.session_name, self.pid });
+        std.log.info("sending SIGHUP session={s} pid={d} fg_pgrp={d}", .{ self.session_name, self.pid, fg_pgrp });
         posix.kill(-self.pid, posix.SIG.HUP) catch |err| {
             std.log.warn("failed to send SIGHUP to pty child err={s}", .{@errorName(err)});
         };
+        if (fg_is_own_group) {
+            posix.kill(-fg_pgrp, posix.SIG.HUP) catch |err| {
+                std.log.warn("failed to send SIGHUP to foreground group err={s}", .{@errorName(err)});
+            };
+        }
         std.Thread.sleep(500 * std.time.ns_per_ms);
         posix.kill(-self.pid, posix.SIG.KILL) catch |err| {
             std.log.warn("failed to send SIGKILL to pty child err={s}", .{@errorName(err)});
         };
+        if (fg_is_own_group) {
+            posix.kill(-fg_pgrp, posix.SIG.KILL) catch |err| {
+                std.log.warn("failed to send SIGKILL to foreground group err={s}", .{@errorName(err)});
+            };
+        }
     }
 
     pub fn handleInfo(self: *Daemon, client: *Client) !void {
