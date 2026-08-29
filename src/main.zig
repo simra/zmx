@@ -1003,7 +1003,16 @@ const Daemon = struct {
                     _ = posix.waitpid(self.pid, 0);
                 }
 
-                try daemonLoop(self, server_sock_fd, pty_fd);
+                // Log before the error propagates: the shutdown defer above prints
+                // "kill received" for every death, so without this line an errored
+                // daemon is indistinguishable from a killed one in the session log.
+                daemonLoop(self, server_sock_fd, pty_fd) catch |err| {
+                    std.log.err(
+                        "daemon loop error session={s} err={s}",
+                        .{ self.session_name, @errorName(err) },
+                    );
+                    return err;
+                };
                 std.log.info("daemon loop shutdown", .{});
                 return .{ .created = true, .is_daemon = true };
             }
