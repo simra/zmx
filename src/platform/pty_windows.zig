@@ -210,12 +210,7 @@ pub fn buildCommandLine(alloc: std.mem.Allocator, spec: pty.SpawnSpec) ![]u8 {
 }
 
 pub fn sizeToCoord(size: resize.Size) Error!if (builtin.os.tag == .windows) std.os.windows.COORD else void {
-    if (!resize.isUsable(size)) return error.InvalidSize;
-    if (size.cols > @as(u16, @intCast(std.math.maxInt(i16))) or
-        size.rows > @as(u16, @intCast(std.math.maxInt(i16))))
-    {
-        return error.InvalidSize;
-    }
+    if (!resize.isConptyCompatible(size)) return error.InvalidSize;
 
     if (builtin.os.tag == .windows) {
         return .{
@@ -1646,7 +1641,53 @@ test "real ConPTY sends Ctrl+C to the attached process" {
     backend(&state).signal(spawned.process, .kill) catch {};
 }
 
-test "real ConPTY accepts resize updates" {
+fn observedConsoleColumns(output: []const u8) ?u16 {
+    const marker = "Columns:";
+    const marker_index = std.mem.lastIndexOf(u8, output, marker) orelse return null;
+    const value_start = marker_index + marker.len;
+    const remaining = output[value_start..];
+    const digits_start = std.mem.indexOfNone(u8, remaining, " \t") orelse return null;
+    var digits_end = digits_start;
+    while (digits_end < remaining.len and std.ascii.isDigit(remaining[digits_end])) {
+        digits_end += 1;
+    }
+    if (digits_end == digits_start) return null;
+    return std.fmt.parseInt(u16, remaining[digits_start..digits_end], 10) catch null;
+}
+
+fn expectConsoleColumns(state: *BackendState, master: pty.Handle, expected: u16) !void {
+    var drain: [4096]u8 = undefined;
+    while (true) {
+        const count = read(state, master, &drain) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (count == 0) break;
+    }
+
+    const command = "mode con\r\n";
+    try std.testing.expectEqual(command.len, try write(state, master, command));
+
+    var output: [8192]u8 = undefined;
+    var total: usize = 0;
+    var last_observed: ?u16 = null;
+    for (0..200) |_| {
+        const count = read(state, master, output[total..]) catch |err| switch (err) {
+            error.WouldBlock => 0,
+            else => return err,
+        };
+        total += count;
+        if (observedConsoleColumns(output[0..total])) |actual| {
+            last_observed = actual;
+            if (actual == expected) return;
+        }
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    if (last_observed) |actual| try std.testing.expectEqual(expected, actual);
+    return error.ConsoleWidthNotObserved;
+}
+
+test "real ConPTY reports 80 120 and 160 column resize updates" {
     if (builtin.os.tag != .windows) return;
 
     var state = init(std.testing.allocator);
@@ -1658,10 +1699,16 @@ test "real ConPTY accepts resize updates" {
         .command = null,
         .size = .{ .rows = 24, .cols = 80 },
     });
-    defer reap(&state, spawned.process);
+    defer {
+        backend(&state).signal(spawned.process, .kill) catch {};
+        reap(&state, spawned.process);
+    }
 
-    try backend(&state).resize(spawned.master, .{ .rows = 40, .cols = 120 });
-    try backend(&state).signal(spawned.process, .kill);
+    try expectConsoleColumns(&state, spawned.master, 80);
+    try backend(&state).resize(spawned.master, .{ .rows = 30, .cols = 120 });
+    try expectConsoleColumns(&state, spawned.master, 120);
+    try backend(&state).resize(spawned.master, .{ .rows = 40, .cols = 160 });
+    try expectConsoleColumns(&state, spawned.master, 160);
 }
 
 test "real ConPTY worker queues preserve input and EOF semantics" {

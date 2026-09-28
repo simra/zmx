@@ -990,24 +990,27 @@ fn writePtyIfGeneration(
     return writePtyCancellable(session, null, generation, bytes);
 }
 
-fn resizePtyLocked(session: *Session, size: resize.Size) void {
-    session.runtime.resize(session.master, size) catch {};
+fn resizePtyLocked(session: *Session, size: resize.Size) !void {
+    try session.runtime.resize(session.master, size);
     session.lockTerminal();
-    session.terminal.resize(session.alloc, .{
+    defer session.unlockTerminal();
+    try session.terminal.resize(session.alloc, .{
         .cols = size.cols,
         .rows = size.rows,
-    }) catch {};
-    session.unlockTerminal();
+    });
 }
 
 const ResizePtyContext = struct {
     session: *Session,
     size: resize.Size,
+    failure: ?anyerror = null,
 };
 
 fn resizePtyOperation(context: *anyopaque) void {
     const resize_context: *ResizePtyContext = @ptrCast(@alignCast(context));
-    resizePtyLocked(resize_context.session, resize_context.size);
+    resizePtyLocked(resize_context.session, resize_context.size) catch |err| {
+        resize_context.failure = err;
+    };
 }
 
 fn resizePtyIfLeader(
@@ -1015,18 +1018,32 @@ fn resizePtyIfLeader(
     client: *Client,
     generation: u64,
     size: resize.Size,
-) bool {
+) !bool {
     var context = ResizePtyContext{
         .session = session,
         .size = size,
     };
-    return withLeaderPtyOperation(
+    const committed = withLeaderPtyOperation(
         session,
         client,
         generation,
         resizePtyOperation,
         @ptrCast(&context),
     );
+    if (context.failure) |err| return err;
+    return committed;
+}
+
+fn resizePtyFromControl(session: *Session, size: resize.Size) !void {
+    if (!session.alive.load(.acquire)) return error.ProcessExited;
+    session.lockPty();
+    defer session.unlockPty();
+    if (!session.alive.load(.acquire)) return error.ProcessExited;
+    try resizePtyLocked(session, size);
+}
+
+fn sendCommandError(client: *Client, err: anyerror) void {
+    client.enqueue(.Error, @errorName(err)) catch client.eject();
 }
 
 fn asciiStartsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -1366,11 +1383,31 @@ fn clientMain(client: *Client) void {
                 broadcast(session, .Output, frame.payload);
             },
             .Resize => {
-                if (frame.payload.len == @sizeOf(wire.Resize)) {
+                if (frame.payload.len != @sizeOf(wire.Resize)) {
+                    if (!client.foreground.load(.acquire)) {
+                        sendCommandError(client, error.InvalidSize);
+                    }
+                } else {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
+                    if (!client.foreground.load(.acquire)) {
+                        resizePtyFromControl(session, size) catch |err| {
+                            sendCommandError(client, err);
+                            continue;
+                        };
+                        client.enqueue(.Ack, "") catch client.eject();
+                        continue;
+                    }
                     const snapshot = leaderSnapshot(session, client);
                     if (snapshot.is_leader) {
-                        _ = resizePtyIfLeader(session, client, snapshot.generation, size);
+                        _ = resizePtyIfLeader(
+                            session,
+                            client,
+                            snapshot.generation,
+                            size,
+                        ) catch {
+                            client.eject();
+                            continue;
+                        };
                     }
                 }
             },
@@ -1385,7 +1422,15 @@ fn clientMain(client: *Client) void {
                     const size = std.mem.bytesToValue(wire.Resize, frame.payload);
                     const snapshot = leaderSnapshot(session, client);
                     if (snapshot.is_leader) {
-                        _ = resizePtyIfLeader(session, client, snapshot.generation, size);
+                        _ = resizePtyIfLeader(
+                            session,
+                            client,
+                            snapshot.generation,
+                            size,
+                        ) catch {
+                            client.eject();
+                            continue;
+                        };
                     }
                 }
             },

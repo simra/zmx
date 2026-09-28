@@ -20,6 +20,11 @@ pub fn isUsable(size: Size) bool {
     return size.rows > 0 and size.cols > 0;
 }
 
+pub fn isConptyCompatible(size: Size) bool {
+    const maximum: u16 = @intCast(std.math.maxInt(i16));
+    return isUsable(size) and size.rows <= maximum and size.cols <= maximum;
+}
+
 pub fn fallback() Size {
     return .{ .rows = 24, .cols = 120 };
 }
@@ -28,4 +33,6 @@ test "resize contract remains the eight-byte wire shape" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Size));
     try std.testing.expect(isUsable(.{ .rows = 24, .cols = 120 }));
     try std.testing.expect(!isUsable(.{ .rows = 0, .cols = 120 }));
+    try std.testing.expect(isConptyCompatible(.{ .rows = 24, .cols = 160 }));
+    try std.testing.expect(!isConptyCompatible(.{ .rows = 24, .cols = 0xffff }));
 }

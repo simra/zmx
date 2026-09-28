@@ -163,6 +163,7 @@ fn awaitResponse(
         );
         defer response.deinit(alloc);
         if (response.header.tag == expected_tag) return;
+        if (response.header.tag == .Error) return error.RemoteCommandFailed;
         if (response.header.tag == .Output or response.header.tag == .TaskComplete) continue;
         return error.Unexpected;
     }
@@ -243,12 +244,21 @@ fn sendPayload(
     const expected = switch (tag) {
         .Info => WireTag.Info,
         .LabelGet => WireTag.LabelData,
-        .LabelSet, .LabelClear, .Write => WireTag.Ack,
+        .Resize, .LabelSet, .LabelClear, .Write => WireTag.Ack,
         else => null,
     };
     if (expected) |response_tag| {
         try awaitResponse(alloc, connection, response_tag);
     }
+}
+
+fn parseResizeSize(cols_text: []const u8, rows_text: []const u8) !wire.Resize {
+    const size = wire.Resize{
+        .cols = try std.fmt.parseInt(u16, cols_text, 10),
+        .rows = try std.fmt.parseInt(u16, rows_text, 10),
+    };
+    if (!resize.isConptyCompatible(size)) return error.InvalidSize;
+    return size;
 }
 
 fn requestResponse(
@@ -1233,10 +1243,8 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(session_name);
         const cols_text = args.next() orelse return error.InvalidSize;
         const rows_text = args.next() orelse return error.InvalidSize;
-        const size = wire.Resize{
-            .cols = try std.fmt.parseInt(u16, cols_text, 10),
-            .rows = try std.fmt.parseInt(u16, rows_text, 10),
-        };
+        if (args.next() != null) return error.UnsupportedCommand;
+        const size = try parseResizeSize(cols_text, rows_text);
         return sendPayload(io, gpa, &cfg, session_name, .Resize, std.mem.asBytes(&size));
     }
 
@@ -1368,6 +1376,24 @@ test "Windows production commands route run and attach through the session adapt
     const value = pty_session_windows.provider();
     try std.testing.expect(@intFromPtr(value.host_fn) != 0);
     try std.testing.expect(@intFromPtr(value.attach_fn) != 0);
+}
+
+test "Windows resize arguments preserve columns then rows and reject invalid bounds" {
+    try std.testing.expectEqual(
+        wire.Resize{ .cols = 80, .rows = 24 },
+        try parseResizeSize("80", "24"),
+    );
+    try std.testing.expectEqual(
+        wire.Resize{ .cols = 120, .rows = 40 },
+        try parseResizeSize("120", "40"),
+    );
+    try std.testing.expectEqual(
+        wire.Resize{ .cols = 160, .rows = 50 },
+        try parseResizeSize("160", "50"),
+    );
+    try std.testing.expectError(error.InvalidSize, parseResizeSize("0", "24"));
+    try std.testing.expectError(error.InvalidSize, parseResizeSize("80", "0"));
+    try std.testing.expectError(error.InvalidSize, parseResizeSize("65535", "24"));
 }
 
 test "Windows root exports the logging hook through std_options" {
