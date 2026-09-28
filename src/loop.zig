@@ -3,15 +3,20 @@ const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const util = @import("util.zig");
-const cross = @import("cross.zig");
+const pty_posix = @import("platform/pty_posix.zig");
+const events_posix = @import("platform/events_posix.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
-const Cfg = @import("cfg.zig");
+const Cfg = @import("cfg.zig").Cfg;
 const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
+const platform_daemon = @import("platform/daemon.zig");
+const pty = @import("platform/pty.zig");
+const pty_runtime = @import("platform/pty_runtime.zig");
+const platform_resize = @import("platform/resize.zig");
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
@@ -63,6 +68,8 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
     _ = try lib_posix.fcntl(stdin_fd, lib_posix.F.SETFL, stdin_orig_flags | lib_posix.O_NONBLOCK);
     defer _ = lib_posix.fcntl(stdin_fd, lib_posix.F.SETFL, stdin_orig_flags) catch {};
 
+    const detach_key_disabled = util.isDetachKeyDisabled();
+
     while (true) {
         poll_fds.clearRetainingCapacity();
 
@@ -93,7 +100,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        _ = try events_posix.poll(poll_fds.items, -1);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -113,7 +120,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
             if (n_opt) |n| {
                 if (n > 0) {
                     // Check for detach sequences (ctrl+\ as first byte or Kitty escape sequence)
-                    if (util.isCtrlBackslash(buf[0..n])) {
+                    if (!detach_key_disabled and util.isCtrlBackslash(buf[0..n])) {
                         std.log.info("detach key detected", .{});
                         try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
                     } else {
@@ -163,7 +170,16 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
                     },
                     .Switch => {
                         std.log.info("switch session", .{});
-                        return ClientResult{ .kind = .switch_session, .session_name = try gpa.dupe(u8, msg.payload) };
+                        // Payload format: "session_name\ncwd" from the daemon
+                        const newline_idx = std.mem.indexOfScalar(u8, msg.payload, '\n') orelse {
+                            // No cwd provided (backward compat or old daemon)
+                            return ClientResult{ .kind = .switch_session, .session_name = try gpa.dupe(u8, msg.payload) };
+                        };
+                        return ClientResult{
+                            .kind = .switch_session,
+                            .session_name = try gpa.dupe(u8, msg.payload[0..newline_idx]),
+                            .cwd = if (newline_idx + 1 < msg.payload.len) try gpa.dupe(u8, msg.payload[newline_idx + 1 ..]) else null,
+                        };
                     },
                     else => {},
                 }
@@ -218,7 +234,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     var term = try ghostty_vt.Terminal.init(io, gpa, .{
         .cols = init_size.cols,
         .rows = init_size.rows,
-        .max_scrollback = daemon.cfg.max_scrollback,
+        .max_scrollback_lines = daemon.cfg.max_scrollback_lines,
     });
     defer term.deinit(gpa);
     var vt_stream = term.vtStream();
@@ -263,7 +279,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        _ = try events_posix.poll(poll_fds.items, -1);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -326,6 +342,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
+                    daemon.setPwd(&term);
                     daemon.has_pty_output = true;
 
                     // When no real terminal client has attached yet, respond to
@@ -350,7 +367,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         @memcpy(scan_buf[marker_carry_len..][0..n], buf[0..n]);
                         const scan_len = marker_carry_len + n;
 
-                        if (util.findTaskExitMarker(scan_buf[0..scan_len])) |exit_code| {
+                        if (try util.findTaskExitMarker(scan_buf[0..scan_len], daemon.task_id)) |exit_code| {
                             daemon.task_exit_code = exit_code;
                             daemon.task_ended_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds());
 
@@ -442,7 +459,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(gpa, client, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
-                        .Output => try daemon.handleOutput(gpa, msg.payload, &vt_stream),
+                        .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
@@ -457,12 +474,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Kill => {
                             break :daemon_loop;
                         },
-                        .Info => try daemon.handleInfo(gpa, client),
+                        .Info => try daemon.handleInfo(gpa, client, &term),
                         .LabelGet => try daemon.handleLabelGet(gpa, client),
                         .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
                         .LabelClear => try daemon.handleLabelClear(gpa, client),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
-                        .Run => try daemon.handleRun(gpa, client, msg.payload),
+                        .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .Ack, .TaskComplete, .LabelData => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
@@ -506,6 +523,7 @@ const ClientResult = struct {
         switch_session,
     },
     session_name: ?[]const u8,
+    cwd: ?[]const u8 = null,
 };
 
 /// Client represents each terminal that has connected to a session.
@@ -517,11 +535,18 @@ pub const Client = struct {
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
+    /// Keep VT parsing state per client so input split across socket reads is
+    /// classified against the complete stream.
+    classifier: util.InputClassifier = .{},
+    /// Hold an incomplete escape sequence until its tail arrives.
+    input_carry: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *Client) void {
         lib_posix.close(self.socket_fd);
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
+        self.classifier.deinit(self.alloc);
+        self.input_carry.deinit(self.alloc);
     }
 };
 
@@ -547,16 +572,30 @@ pub const Daemon = struct {
     running: bool = true,
     pid: i32 = undefined,
     command: ?[]const []const u8 = null,
+    /// The session's working directory in OSC 7 form, `file://<host><path>`.
+    /// Kept as a URI rather than a path so `zmx list` shows the host, which is
+    /// what tells you a session is inside SSH. Points into `cwd_buf` once set,
+    /// so a Daemon must not be copied by value after that.
     cwd: []const u8 = "",
+    /// The same directory as a path that can be opened: percent-decoding
+    /// applied, scheme and host stripped. Empty when the cwd is on another
+    /// host, since then it names no directory here and nothing should chdir
+    /// into it. Points into `cwd_path_buf`.
+    cwd_path: []const u8 = "",
+    cwd_buf: [std.fs.max_path_bytes]u8 = undefined,
+    cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     has_pty_output: bool = false,
     has_had_client: bool = false,
     has_terminal_client: bool = false, // true only after a real attach (.Init received)
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
+    task_id: [4]u8 = undefined,
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
+    lifetime: platform_daemon.Lifetime = .{},
+    pty_runtime: pty_runtime.Runtime = pty_runtime.Runtime.init(std.heap.c_allocator),
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -566,6 +605,7 @@ pub const Daemon = struct {
             .session_name = sesh_name,
             .socket_path = socket_path,
             .created_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
+            .pty_runtime = pty_runtime.Runtime.init(std.heap.c_allocator),
         };
     }
 
@@ -578,12 +618,14 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
+        self.pty_runtime.deinit();
         gpa.free(self.socket_path);
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
         std.log.info("shutting down daemon session={s}", .{self.session_name});
         self.running = false;
+        self.lifetime.stop(.requested);
 
         for (self.clients.items) |client| {
             client.deinit();
@@ -676,10 +718,36 @@ pub const Daemon = struct {
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
         const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
+        const spawn_spec = pty.SpawnSpec{
+            .session_name = sesh_name,
+            .shell = self.shell,
+            .task_mode = self.is_task_mode,
+            .command = self.command,
+            .size = platform_resize.fallback(),
+        };
+
+        // `cwd_path` is the decoded path, and is empty when the cwd is on
+        // another host: OSC 7 crosses SSH boundaries, so a session that ssh'd
+        // elsewhere reports a directory that does not exist on this machine.
+        std.log.info("checking pwd={s} path={s}", .{ self.cwd, self.cwd_path });
+        if (self.cwd_path.len > 0) {
+            const pwd_dir = std.Io.Dir.openDirAbsolute(io, self.cwd_path, .{}) catch |err| blk: {
+                std.log.warn("failed to open dir={s} err={s}", .{ self.cwd_path, @errorName(err) });
+                break :blk null;
+            };
+            if (pwd_dir) |pdir| {
+                defer std.Io.Dir.close(pdir, io);
+                std.log.info("set directory dir={s}", .{self.cwd_path});
+                try std.process.setCurrentDir(io, pdir);
+            }
+        }
+
         const pty_info = daemonize.daemonize(
             sesh_name,
             cmd,
             &keep_fds_open,
+            &self.pty_runtime,
+            spawn_spec,
         ) catch |err| {
             switch (err) {
                 error.IsClientProc => {
@@ -706,6 +774,7 @@ pub const Daemon = struct {
         // =======
 
         self.pid = pty_info.pid;
+        self.lifetime.started();
 
         var threaded: std.Io.Threaded = .init_single_threaded;
         defer threaded.deinit();
@@ -725,7 +794,7 @@ pub const Daemon = struct {
                 fba.allocator(),
                 &.{ self.cfg.log_dir, session_log_name },
             );
-            const log_mode = std.Io.File.Permissions.fromMode(self.cfg.log_mode);
+            const log_mode = std.Io.File.Permissions.fromMode(@intCast(self.cfg.log_mode));
             log.log_system.init(new_io, session_log_path, log_mode) catch {};
         }
 
@@ -754,6 +823,7 @@ pub const Daemon = struct {
             self.deinit(gpa);
             lib_posix.close(pty_info.master_fd);
             _ = lib_posix.waitpid(self.pid, 0);
+            self.lifetime.stopped();
         }
 
         try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
@@ -786,7 +856,10 @@ pub const Daemon = struct {
             );
             return;
         }
-        std.log.debug("buffering pty input data={x}", .{data});
+
+        // NOTE: for local dev only
+        // std.log.debug("buffering pty input data={x}", .{data});
+
         self.pty_write_buf.appendSlice(gpa, data) catch |err| {
             std.log.warn(
                 "pty input dropped {d} bytes: {s}",
@@ -795,18 +868,140 @@ pub const Daemon = struct {
         };
     }
 
+    const MAX_INPUT_CARRY = 128;
+    const MAX_KITTY_CARRY = 64 * 1024;
+
     pub fn handleInput(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
-        std.log.debug("buffering pty input data={x}", .{payload});
-        // client is leader, send entire payload (ansi escape codes + text)
-        if (self.leader_client_fd == client.socket_fd) {
+        // NOTE: for local dev only
+        // std.log.debug("buffering pty input data={x}", .{payload});
+
+        const was_leader = self.leader_client_fd == client.socket_fd;
+
+        // Classify every chunk, including the leader's, so the parser remains
+        // synchronized with each client's input stream.
+        const class = try client.classifier.classify(gpa, payload);
+        if (class.discarded) return;
+
+        // A leader normally sends the entire payload (ANSI escape codes + text),
+        // but an incomplete sequence must take the filtered path so its prefix
+        // can be held back until the report is complete.
+        if (was_leader and
+            client.input_carry.items.len == 0 and
+            class.tail_start == null)
+        {
             self.queuePtyInput(gpa, payload);
             return;
         }
 
-        // check if leader needs to be updated by detecting any user input
-        if (util.isUserInput(payload)) {
-            try self.setLeader(gpa, client);
+        // A lone ESC is itself a valid key. Do not hold it indefinitely as an
+        // escape prefix; reset parser state so a later chunk starts cleanly.
+        if (was_leader and
+            client.input_carry.items.len == 0 and
+            payload.len == 1 and
+            payload[0] == 0x1b)
+        {
             self.queuePtyInput(gpa, payload);
+            client.classifier.markEmittedPrefix();
+            return;
+        }
+
+        var carry_prefix_len: usize = 0;
+        if (class.tail_start) |tail_index| {
+            carry_prefix_len = if (tail_index == 0) client.input_carry.items.len else 0;
+            const partial_len = payload.len - tail_index;
+            const carry_limit: usize = if (class.allow_large_carry) MAX_KITTY_CARRY else MAX_INPUT_CARRY;
+            if (partial_len > carry_limit or
+                carry_prefix_len > carry_limit - partial_len)
+            {
+                client.input_carry.clearRetainingCapacity();
+                client.classifier.quarantine();
+                return;
+            }
+            client.input_carry.ensureTotalCapacity(gpa, carry_prefix_len + partial_len) catch {
+                client.input_carry.clearRetainingCapacity();
+                client.classifier.quarantine();
+                return;
+            };
+        }
+
+        // A trailing ESC is also a standalone leader byte even when ordinary
+        // input precedes it. Flush the whole payload and retain its parser
+        // provenance for a possible continuation in a later chunk.
+        if (was_leader and client.input_carry.items.len == 0) {
+            if (class.tail_start) |tail_index| {
+                if (payload.len - tail_index == 1 and payload[tail_index] == 0x1b) {
+                    self.queuePtyInput(gpa, payload);
+                    client.classifier.markEmittedPrefix();
+                    return;
+                }
+            }
+        }
+
+        // Preserve raw leader behavior for complete bytes before a trailing
+        // partial sequence, while carrying only that unfinished suffix.
+        if (was_leader and client.input_carry.items.len == 0) {
+            if (class.tail_start) |tail_index| {
+                if (tail_index > 0) {
+                    self.queuePtyInput(gpa, payload[0..tail_index]);
+                    client.input_carry.clearRetainingCapacity();
+                    try client.input_carry.appendSlice(gpa, payload[tail_index..]);
+                    return;
+                }
+            }
+        }
+
+        // A sequence that started while this client was leader retains the
+        // leader's raw-input semantics if it completes before leadership
+        // changes. Once another client takes over, the filtered range path
+        // below suppresses replies and focus events as usual.
+        if (was_leader and client.input_carry.items.len > 0) {
+            if (class.completed_carry_end != null) {
+                const raw_end = if (class.tail_start) |tail_index| tail_index else payload.len;
+                if (raw_end > 0) {
+                    var input = std.ArrayList(u8).empty;
+                    defer input.deinit(gpa);
+                    try input.appendSlice(gpa, client.input_carry.items);
+                    try input.appendSlice(gpa, payload[0..raw_end]);
+                    self.queuePtyInput(gpa, input.items);
+                    client.input_carry.clearRetainingCapacity();
+                    if (class.tail_start) |tail_index| {
+                        if (tail_index > 0) {
+                            try client.input_carry.appendSlice(gpa, payload[tail_index..]);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Keyboard input claims leadership, but still shares the filtered
+        // stream path so carried mouse prefixes and terminal events retain
+        // their correct ordering and filtering.
+        if (class.claims_leadership and self.leader_client_fd != client.socket_fd) {
+            try self.setLeader(gpa, client);
+        }
+
+        // Forward only complete mouse and keyboard ranges. A range marked
+        // from_carry is emitted with its held-back prefix in one contiguous
+        // PTY append.
+        if (class.ranges.len > 0) {
+            var input = std.ArrayList(u8).empty;
+            defer input.deinit(gpa);
+            for (class.ranges) |range| {
+                if (!was_leader and range.from_emitted) continue;
+                if (range.from_carry) {
+                    try input.appendSlice(gpa, client.input_carry.items);
+                }
+                try input.appendSlice(gpa, payload[range.start..range.end]);
+            }
+            self.queuePtyInput(gpa, input.items);
+        }
+
+        if (class.tail_start) |tail_index| {
+            if (carry_prefix_len == 0) client.input_carry.clearRetainingCapacity();
+            try client.input_carry.appendSlice(gpa, payload[tail_index..]);
+        } else {
+            client.input_carry.clearRetainingCapacity();
         }
     }
 
@@ -818,17 +1013,30 @@ pub const Daemon = struct {
     pub fn handleSwitch(self: *Daemon, gpa: std.mem.Allocator, session_name: []const u8) !void {
         for (self.clients.items) |client| {
             if (self.leader_client_fd == client.socket_fd) {
-                ipc.appendMessage(
-                    gpa,
-                    &client.write_buf,
-                    .Switch,
-                    session_name,
-                ) catch |err| {
-                    std.log.warn(
-                        "failed to buffer terminal state for client err={s}",
-                        .{@errorName(err)},
-                    );
-                };
+                // Include the daemon's current cwd so the new session can start
+                // in the right directory. A remote cwd is left out: it names no
+                // directory here, so the new session is better off with the
+                // attaching client's own cwd than with a path it cannot enter.
+                if (self.cwd.len > 0 and self.cwd_path.len > 0) {
+                    var payload = gpa.alloc(u8, session_name.len + 1 + self.cwd.len) catch return;
+                    defer gpa.free(payload);
+                    @memcpy(payload[0..session_name.len], session_name);
+                    payload[session_name.len] = '\n';
+                    @memcpy(payload[session_name.len + 1 ..], self.cwd);
+                    ipc.appendMessage(gpa, &client.write_buf, .Switch, payload) catch |err| {
+                        std.log.warn(
+                            "failed to buffer terminal state for client err={s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                } else {
+                    ipc.appendMessage(gpa, &client.write_buf, .Switch, session_name) catch |err| {
+                        std.log.warn(
+                            "failed to buffer terminal state for client err={s}",
+                            .{@errorName(err)},
+                        );
+                    };
+                }
                 client.has_pending_output = true;
                 return;
             }
@@ -882,13 +1090,7 @@ pub const Daemon = struct {
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
             const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = resize.xpixel,
-                .ws_ypixel = resize.ypixel,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+            pty_posix.resizeMaster(pty_fd, resize);
             // Disable prompt_redraw before resize. The daemon's internal terminal
             // would otherwise clear prompt lines expecting the shell to redraw them,
             // but the shell's redraw goes to the PTY (forwarded to clients), not to
@@ -926,13 +1128,7 @@ pub const Daemon = struct {
         if (self.leader_client_fd != client.socket_fd) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = resize.xpixel,
-            .ws_ypixel = resize.ypixel,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        pty_posix.resizeMaster(pty_fd, resize);
         // Disable prompt_redraw before resize (same rationale as handleInit).
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;
@@ -962,6 +1158,16 @@ pub const Daemon = struct {
     pub fn handleKill(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) void {
         std.log.info("kill received session={s}", .{self.session_name});
         self.shutdown(gpa);
+        if (comptime builtin.os.tag == .windows) {
+            self.pty_runtime.signal(@intCast(self.pid), .hangup) catch |err| {
+                std.log.warn("failed to send ConPTY Ctrl+C err={s}", .{@errorName(err)});
+            };
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .real) catch unreachable;
+            self.pty_runtime.signal(@intCast(self.pid), .kill) catch |err| {
+                std.log.warn("failed to terminate ConPTY job err={s}", .{@errorName(err)});
+            };
+            return;
+        }
         // gracefully shutdown shell processes, shells tend to ignore SIGTERM so we send SIGHUP
         // instead
         //   https://www.gnu.org/software/bash/manual/html_node/Signals.html
@@ -976,7 +1182,9 @@ pub const Daemon = struct {
         };
     }
 
-    pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+    pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) !void {
+        self.setPwd(term);
+
         // zeroes() so asBytes() doesn't ship struct padding + unused cmd/cwd
         // tail bytes (daemon stack contents) to clients.
         var info = std.mem.zeroes(ipc.Info);
@@ -1025,12 +1233,13 @@ pub const Daemon = struct {
     }
 
     pub fn handleHistory(
-        _: *Daemon,
+        self: *Daemon,
         gpa: std.mem.Allocator,
         client: *Client,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
+        self.setPwd(term);
         const format: util.HistoryFormat = if (payload.len > 0)
             @enumFromInt(payload[0])
         else
@@ -1045,13 +1254,14 @@ pub const Daemon = struct {
         }
     }
 
-    pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+    pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
         // Reset task tracking so the new command's exit marker is detected.
         // Without this, a second `zmx run` on the same session is ignored
         // because task_exit_code is still set from the first run.
         self.task_exit_code = null;
         self.task_ended_at = null;
         self.is_task_mode = true;
+        self.task_id = util.generateTaskId(io);
 
         if (payload.len == 0) return;
 
@@ -1061,8 +1271,12 @@ pub const Daemon = struct {
         // exit code of the command (not the `;`). The sole exception is when
         // the command contains a heredoc (`<<`), the delimiter must be alone
         // on its line, so the marker goes on the next line instead.
-        const single_line_marker = "; echo ZMX_TASK_COMPLETED:$?\r";
-        const heredoc_marker = "\r\necho ZMX_TASK_COMPLETED:$?\r";
+        var buf: [1024]u8 = undefined;
+        const marker = try util.getTaskExitMarker(&buf, self.task_id);
+        var single_buf: [1024]u8 = undefined;
+        const single_line_marker = try std.fmt.bufPrint(&single_buf, "; echo {s}$?\r", .{marker});
+        var here_buf: [1024]u8 = undefined;
+        const heredoc_marker = try std.fmt.bufPrint(&here_buf, "\r\necho {s}$?\r", .{marker});
         const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
 
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
@@ -1078,8 +1292,53 @@ pub const Daemon = struct {
         std.log.debug("run command len={d}", .{payload.len});
     }
 
-    pub fn handleOutput(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8, vt_stream: anytype) !void {
+    /// Store the session's working directory as a plain path.
+    ///
+    /// Accepts either an OSC 7 value (`file://<host><path>`, percent-encoded)
+    /// or a path. Decoding here rather than at each use keeps `zmx list`
+    /// printing a path and lets the chdir on session create find directories
+    /// whose names needed escaping.
+    ///
+    /// The value is copied, so callers may pass a temporary.
+    pub fn setCwd(self: *Daemon, value: []const u8) void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const hostname = std.posix.gethostname(&host_buf) catch "";
+        const cwd = util.parseOsc7Cwd(&buf, value, hostname) orelse {
+            std.log.warn("ignoring unusable cwd={s}", .{value});
+            return;
+        };
+
+        // Store the URI form. A caller that handed us a plain path gets one
+        // built here, so `cwd` has the same shape no matter the source. A value
+        // that already was a URI is kept verbatim, so `list` shows what the
+        // shell actually reported.
+        self.cwd = if (std.fs.path.isAbsolute(value))
+            util.toOsc7Cwd(&self.cwd_buf, value, hostname) orelse return
+        else blk: {
+            if (value.len > self.cwd_buf.len) return;
+            @memcpy(self.cwd_buf[0..value.len], value);
+            break :blk self.cwd_buf[0..value.len];
+        };
+
+        // Only keep an openable path when it names a directory on this host.
+        if (cwd.is_local and cwd.path.len <= self.cwd_path_buf.len) {
+            @memcpy(self.cwd_path_buf[0..cwd.path.len], cwd.path);
+            self.cwd_path = self.cwd_path_buf[0..cwd.path.len];
+        } else {
+            self.cwd_path = "";
+        }
+        std.log.info("set cwd={s} path={s}", .{ self.cwd, self.cwd_path });
+    }
+
+    fn setPwd(self: *Daemon, term: *ghostty_vt.Terminal) void {
+        const pwd = term.getPwd() orelse return;
+        self.setCwd(pwd);
+    }
+
+    pub fn handleOutput(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8, term: *ghostty_vt.Terminal, vt_stream: anytype) !void {
         vt_stream.nextSlice(payload);
+        self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
             try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
@@ -1209,4 +1468,1487 @@ test "send queues PTY input without changing leader" {
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);
+}
+
+test "non-leader SGR mouse input is forwarded without changing leader" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[<64;10;10M");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[<64;10;10M", daemon.pty_write_buf.items);
+}
+
+test "non-leader X10 mouse input is forwarded without changing leader" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[M !!");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[M !!", daemon.pty_write_buf.items);
+}
+
+test "non-leader split SGR mouse input is reassembled as one report" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[<6");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, "5;90;20M");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[<65;90;20M", daemon.pty_write_buf.items);
+}
+
+test "non-leader keyboard input claims leadership and is forwarded" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "x");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+}
+
+test "non-leader focus events are dropped without changing leader" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[I\x1b[O");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "non-leader terminal replies are dropped without changing leader" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[1;2R\x1b[?1;2c");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "coalesced mouse ranges exclude carried replies and terminal events" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[1;2");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, "R\x1b[<64;10;10M\x1b[I\x1b[<65;11;11m\x1b[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings(
+        "\x1b[<64;10;10M\x1b[<65;11;11m",
+        daemon.pty_write_buf.items,
+    );
+}
+
+test "non-leader X10 mouse report waits for all coordinates before emitting" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[M");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, " !!");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[M !!", daemon.pty_write_buf.items);
+}
+
+test "input carry overflow resets classifier and suppresses its suffix" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    var oversized: [129]u8 = undefined;
+    @memset(&oversized, '1');
+    @memcpy(oversized[0..3], "\x1b[<");
+    try daemon.handleInput(alloc, &client, &oversized);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, "64;10;10M");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, "\x1b[<64;10;10M");
+    try std.testing.expectEqualStrings("\x1b[<64;10;10M", daemon.pty_write_buf.items);
+}
+
+test "split SGR mouse plus keyboard preserves order and filters terminal events" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[<6");
+    try daemon.handleInput(alloc, &client, "5;90;20Mx\x1b[I\x1b[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[<65;90;20Mx", daemon.pty_write_buf.items);
+}
+
+test "split X10 mouse plus keyboard preserves order and filters terminal events" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[M");
+    try daemon.handleInput(alloc, &client, " !!x\x1b[O\x1b[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[M !!x", daemon.pty_write_buf.items);
+}
+
+test "carried reply and focus plus keyboard suppresses terminal events" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[1;2");
+    try daemon.handleInput(alloc, &client, "R\x1b[Ix\x1b[O\x1b[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+}
+
+test "new leader continues a carried SGR mouse after keyboard input" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "x\x1b[<6");
+    try daemon.handleInput(alloc, &client, "5;90;20M\x1b[I");
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x\x1b[<65;90;20M\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "new leader continues a carried X10 mouse after keyboard input" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "x\x1b[M");
+    try daemon.handleInput(alloc, &client, " !!\x1b[O");
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x\x1b[M !!\x1b[O", daemon.pty_write_buf.items);
+}
+
+test "new leader forwards a carried reply and filters coalesced focus" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "x\x1b[1;2");
+    try daemon.handleInput(alloc, &client, "R\x1b[I");
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x\x1b[1;2R\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "split Kitty CSI-u release remains suppressed" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[102;1:3");
+    try daemon.handleInput(alloc, &client, "u");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "leader split SGR mouse stays atomic across takeover" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[<6");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &follower, "x");
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+
+    try daemon.handleInput(alloc, &leader, "5;90;20M");
+    try std.testing.expectEqualStrings("x\x1b[<65;90;20M", daemon.pty_write_buf.items);
+}
+
+test "leader split X10 mouse stays atomic across takeover" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[M");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &follower, "x");
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+
+    try daemon.handleInput(alloc, &leader, " !!");
+    try std.testing.expectEqualStrings("x\x1b[M !!", daemon.pty_write_buf.items);
+}
+
+test "leader split reply and focus stay suppressed across takeover" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[1;2");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &follower, "x");
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+
+    try daemon.handleInput(alloc, &leader, "R\x1b[");
+    try daemon.handleInput(alloc, &leader, "I");
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+}
+
+test "leader split reply and focus forward while leadership is unchanged" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[1;2");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+    try daemon.handleInput(alloc, &leader, "R");
+    try std.testing.expectEqualStrings("\x1b[1;2R", daemon.pty_write_buf.items);
+    try daemon.handleInput(alloc, &leader, "\x1b[");
+    try std.testing.expectEqualStrings("\x1b[1;2R", daemon.pty_write_buf.items);
+    try daemon.handleInput(alloc, &leader, "I");
+    try std.testing.expectEqualStrings("\x1b[1;2R\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "non-leader complete SS3 key forwards its full sequence" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1bOA");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bOA", daemon.pty_write_buf.items);
+}
+
+test "non-leader split SS3 key forwards its full sequence" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1bO");
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, "A");
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bOA", daemon.pty_write_buf.items);
+}
+
+test "leader standalone ESC is flushed immediately" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+
+    try std.testing.expectEqualStrings("\x1b", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(usize, 0), leader.input_carry.items.len);
+
+    try daemon.handleInput(alloc, &leader, "[I");
+    try std.testing.expectEqualStrings("\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "leader split escape is reassembled while leadership is unchanged" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[");
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+    try daemon.handleInput(alloc, &leader, "I");
+
+    try std.testing.expectEqualStrings("\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "leader split escape is suppressed after takeover" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "I");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x", daemon.pty_write_buf.items);
+}
+
+test "leader forwards complete prefix before trailing partial escape" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b[1;2R\x1b[I\x1b[");
+    try std.testing.expectEqualStrings("\x1b[1;2R\x1b[I", daemon.pty_write_buf.items);
+    try std.testing.expectEqualStrings("\x1b[", leader.input_carry.items);
+
+    try daemon.handleInput(alloc, &leader, "I");
+    try std.testing.expectEqualStrings("\x1b[1;2R\x1b[I\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "non-leader complete prefix before trailing escape stays suppressed" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[1;2R\x1b[I\x1b[");
+    try daemon.handleInput(alloc, &client, "I");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "emitted leader ESC continuation focus cannot retake leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "[I");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
+test "emitted leader ESC continuation reply cannot retake leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
+test "emitted leader ESC preserves SS3 continuation classification" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "OA");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
+test "non-leader complete Kitty CSI-u press claims leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[65;1:1u");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[65;1:1u", daemon.pty_write_buf.items);
+}
+
+test "non-leader complete Kitty CSI-u release stays suppressed" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[65;1:3u");
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+}
+
+test "complete Kitty press consumes emitted leader ESC before takeover" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var former_leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer former_leader.write_buf.deinit(alloc);
+    defer former_leader.classifier.deinit(alloc);
+    defer former_leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &former_leader, "\x1b");
+    try daemon.handleInput(alloc, &former_leader, "\x1b[65;1:1u");
+    try daemon.handleInput(alloc, &follower, "y");
+    try daemon.handleInput(alloc, &former_leader, "x");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b\x1b[65;1:1uyx", daemon.pty_write_buf.items);
+}
+
+test "complete Kitty release consumes emitted leader ESC and stays suppressed" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var former_leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer former_leader.write_buf.deinit(alloc);
+    defer former_leader.classifier.deinit(alloc);
+    defer former_leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &former_leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "y");
+    try daemon.handleInput(alloc, &former_leader, "\x1b[65;1:3u");
+    try daemon.handleInput(alloc, &former_leader, "x");
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1byx", daemon.pty_write_buf.items);
+}
+
+test "emitted leader ESC Kitty continuation cannot retake leadership" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "\x1b");
+    try daemon.handleInput(alloc, &follower, "x");
+    try daemon.handleInput(alloc, &leader, "[65;1:1u");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1bx", daemon.pty_write_buf.items);
+}
+
+test "leader payload trailing ESC flushes immediately" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "x\x1b");
+
+    try std.testing.expectEqualStrings("x\x1b", daemon.pty_write_buf.items);
+    try std.testing.expectEqual(@as(usize, 0), leader.input_carry.items.len);
+}
+
+test "leader trailing ESC continues same-leader focus raw" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer leader.write_buf.deinit(alloc);
+    defer leader.classifier.deinit(alloc);
+    defer leader.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &leader, "x\x1b");
+    try daemon.handleInput(alloc, &leader, "[I");
+
+    try std.testing.expectEqualStrings("x\x1b[I", daemon.pty_write_buf.items);
+}
+
+test "former leader trailing ESC focus suffix stays filtered" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var former_leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer former_leader.write_buf.deinit(alloc);
+    defer former_leader.classifier.deinit(alloc);
+    defer former_leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &former_leader, "x\x1b");
+    try daemon.handleInput(alloc, &follower, "y");
+    try daemon.handleInput(alloc, &former_leader, "[I");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x\x1by", daemon.pty_write_buf.items);
+}
+
+test "former leader trailing ESC reply suffix stays filtered" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 7,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var former_leader = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer former_leader.write_buf.deinit(alloc);
+    defer former_leader.classifier.deinit(alloc);
+    defer former_leader.input_carry.deinit(alloc);
+
+    var follower = Client{
+        .alloc = alloc,
+        .socket_fd = 8,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer follower.write_buf.deinit(alloc);
+    defer follower.classifier.deinit(alloc);
+    defer follower.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &former_leader, "x\x1b");
+    try daemon.handleInput(alloc, &follower, "y");
+    try daemon.handleInput(alloc, &former_leader, "[1;2R");
+
+    try std.testing.expectEqual(@as(?i32, 8), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("x\x1by", daemon.pty_write_buf.items);
+}
+
+fn makeLongKittySequence(alloc: std.mem.Allocator, event_type: u8, text_len: usize) ![]u8 {
+    var sequence = std.ArrayList(u8).empty;
+    errdefer sequence.deinit(alloc);
+    try sequence.appendSlice(alloc, "\x1b[65;1:");
+    try sequence.append(alloc, event_type);
+    try sequence.append(alloc, ';');
+    var i: usize = 0;
+    while (i < text_len) : (i += 1) {
+        try sequence.append(alloc, '1');
+    }
+    try sequence.append(alloc, 'u');
+    return sequence.toOwnedSlice(alloc);
+}
+
+test "split Kitty press with exactly 128 text bytes forwards full range" {
+    const alloc = std.testing.allocator;
+    const sequence = try makeLongKittySequence(alloc, '1', 128);
+    defer alloc.free(sequence);
+
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, sequence[0..128]);
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
+
+    try daemon.handleInput(alloc, &client, sequence[128..]);
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualSlices(u8, sequence, daemon.pty_write_buf.items);
+}
+
+test "split Kitty press over 128 capture bytes forwards full range" {
+    const alloc = std.testing.allocator;
+    const sequence = try makeLongKittySequence(alloc, '1', 129);
+    defer alloc.free(sequence);
+
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, sequence[0..128]);
+    try daemon.handleInput(alloc, &client, sequence[128..]);
+
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualSlices(u8, sequence, daemon.pty_write_buf.items);
+}
+
+test "split long Kitty release stays suppressed after capture limit" {
+    const alloc = std.testing.allocator;
+    const sequence = try makeLongKittySequence(alloc, '3', 129);
+    defer alloc.free(sequence);
+
+    var daemon = Daemon{
+        .cfg = undefined,
+        .clients = .empty,
+        .leader_client_fd = 42,
+        .session_name = "test",
+        .socket_path = "",
+        .running = true,
+        .pid = 0,
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = undefined,
+        .write_buf = .empty,
+    };
+    defer client.write_buf.deinit(alloc);
+    defer client.classifier.deinit(alloc);
+    defer client.input_carry.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, sequence[0..128]);
+    try daemon.handleInput(alloc, &client, sequence[128..]);
+
+    try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("", daemon.pty_write_buf.items);
 }

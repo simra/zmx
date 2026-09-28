@@ -1,6 +1,14 @@
+const builtin = @import("builtin");
 const std = @import("std");
+const cross = if (builtin.os.tag == .windows) struct {} else @import("cross.zig");
+const windows_runtime = if (builtin.os.tag == .windows) @import("platform/runtime_windows.zig") else struct {};
 
 pub var log_system = LogSystem{};
+
+const default_log_permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows)
+    @enumFromInt(0)
+else
+    std.Io.File.Permissions.fromMode(0o640);
 
 pub fn zmxLogFn(
     comptime level: std.log.Level,
@@ -18,12 +26,13 @@ pub const LogSystem = struct {
     max_size: u64 = 2 * 1024 * 1024, // 2MB
     path: []const u8 = "",
     io: std.Io = undefined,
-    mode: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(0o640),
+    mode: std.Io.File.Permissions = default_log_permissions,
 
     pub fn init(self: *LogSystem, io: std.Io, path: []const u8, mode: std.Io.File.Permissions) !void {
         self.io = io;
         self.path = path;
         self.mode = mode;
+        if (builtin.os.tag == .windows) try windows_runtime.verifyConfiguredLogsPath(path);
 
         const file = std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try std.Io.Dir.createFileAbsolute(
@@ -33,12 +42,26 @@ pub const LogSystem = struct {
             ),
             else => return err,
         };
+        errdefer std.Io.File.close(file, self.io);
+        if (builtin.os.tag == .windows) try windows_runtime.verifyConfiguredLogsPath(path);
 
-        const end_pos = try std.Io.File.length(file, self.io);
-        var buf: [1]u8 = undefined;
-        var w = std.Io.File.writer(file, self.io, &buf);
-        try w.seekTo(end_pos);
-        self.current_size = end_pos;
+        // Use lseek(SEEK_END) instead of length() + seekTo() to avoid a
+        // TOCTOU race: after fork() the parent may still write to the log
+        // between our length() check and seekTo(), causing us to overwrite
+        // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
+        // always positions at the true end of file at seek time.
+        if (builtin.os.tag == .windows) {
+            self.current_size = (try file.stat(self.io)).size;
+            var seek_buf: [1]u8 = undefined;
+            var writer = file.writerStreaming(self.io, &seek_buf);
+            try writer.seekTo(self.current_size);
+        } else {
+            const new_pos = cross.c.lseek(file.handle, 0, cross.c.SEEK_END);
+            if (new_pos == -1) {
+                return error.SeekFailed;
+            }
+            self.current_size = @as(u64, @intCast(new_pos));
+        }
         self.file = file;
     }
 
@@ -73,7 +96,7 @@ pub const LogSystem = struct {
         const level_name = level.asText();
 
         const prefix_args = .{
-            now,
+            now.toSeconds(),
             level_name,
             scope_name,
         };
@@ -93,6 +116,7 @@ pub const LogSystem = struct {
     }
 
     fn wipe(self: *LogSystem) !void {
+        if (builtin.os.tag == .windows) try windows_runtime.verifyConfiguredLogsPath(self.path);
         if (self.file) |f| {
             std.Io.File.close(f, self.io);
             self.file = null;
@@ -107,6 +131,48 @@ pub const LogSystem = struct {
                 .permissions = self.mode,
             },
         );
+        if (builtin.os.tag == .windows) try windows_runtime.verifyConfiguredLogsPath(self.path);
         self.current_size = 0;
     }
 };
+
+test "Windows logs append to existing files after initialization" {
+    if (builtin.os.tag != .windows) return;
+
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(std.testing.io, &cwd_buffer);
+    const path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ cwd_buffer[0..cwd_len], "zmx-log-eof-test.log" },
+    );
+    defer std.testing.allocator.free(path);
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+
+    var existing = try std.Io.Dir.createFileAbsolute(
+        std.testing.io,
+        path,
+        .{ .read = true },
+    );
+    const old_bytes = [_]u8{'x'} ** 5000;
+    try existing.writeStreamingAll(std.testing.io, &old_bytes);
+    existing.close(std.testing.io);
+
+    var system = LogSystem{};
+    try system.init(
+        std.testing.io,
+        path,
+        if (builtin.os.tag == .windows) @enumFromInt(0) else default_log_permissions,
+    );
+    try std.testing.expectEqual(@as(u64, old_bytes.len), system.current_size);
+    try system.log(.info, .scope_test, "suffix", .{});
+    system.deinit();
+
+    const after = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        path,
+        .{ .mode = .read_only },
+    );
+    defer after.close(std.testing.io);
+    try std.testing.expect((try after.stat(std.testing.io)).size > old_bytes.len);
+}

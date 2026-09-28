@@ -11,6 +11,10 @@ const macos_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
 };
 
+const windows_targets: []const std.Target.Query = &.{
+    .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // const is_macos = target.result.os.tag == .macos;
@@ -41,10 +45,7 @@ pub fn build(b: *std.Build) void {
         .@"emit-xcframework" = false,
         .@"emit-macos-app" = false,
     });
-    exe_mod.addImport(
-        "ghostty-vt",
-        dep.module("ghostty-vt"),
-    );
+    exe_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
 
     // Run
     {
@@ -72,17 +73,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        const test_dep = b.dependency("ghostty", .{
-            .target = target,
-            .optimize = optimize,
-            .@"emit-lib-vt" = true,
-            .@"emit-xcframework" = false,
-            .@"emit-macos-app" = false,
-        });
-        test_module.addImport(
-            "ghostty-vt",
-            test_dep.module("ghostty-vt"),
-        );
+        test_module.addImport("ghostty-vt", dep.module("ghostty-vt"));
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             // .use_llvm = true,
@@ -115,7 +106,16 @@ pub fn build(b: *std.Build) void {
             "release",
             "Build release binaries for all platforms",
         );
-        const release_targets = linux_targets ++ macos_targets;
+        const sha256_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/sha256.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        });
+        const sha256_exe = b.addExecutable(.{
+            .name = "zmx-sha256",
+            .root_module = sha256_module,
+        });
+        const release_targets = linux_targets ++ macos_targets ++ windows_targets;
         for (release_targets) |release_target| {
             const resolved = b.resolveTargetQuery(release_target);
             const release_mod = b.createModule(.{
@@ -147,15 +147,16 @@ pub fn build(b: *std.Build) void {
             const os_name = @tagName(release_target.os_tag orelse .linux);
             const arch_name = @tagName(release_target.cpu_arch orelse .x86_64);
             const tarball_name = b.fmt("zmx-{s}-{s}-{s}.tar.gz", .{ version, os_name, arch_name });
+            const binary_name = if (resolved.result.os.tag == .windows) "zmx.exe" else "zmx";
 
             const tar = b.addSystemCommand(&.{ "tar", "-czf" });
 
             const tarball = tar.addOutputFileArg(tarball_name);
             tar.addArg("-C");
             tar.addDirectoryArg(release_exe.getEmittedBinDirectory());
-            tar.addArg("zmx");
+            tar.addArg(binary_name);
 
-            const shasum = b.addSystemCommand(&.{"sha256sum"});
+            const shasum = b.addRunArtifact(sha256_exe);
             shasum.addFileArg(tarball);
             const shasum_output = shasum.captureStdOut(.{});
 

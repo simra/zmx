@@ -1,7 +1,9 @@
 const std = @import("std");
-const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const lib_posix = @import("posix.zig");
+const resize = @import("platform/resize.zig");
+const pty_posix = @import("platform/pty_posix.zig");
+const events_posix = @import("platform/events_posix.zig");
 
 pub const Tag = enum(u8) {
     Input = 0,
@@ -40,23 +42,20 @@ pub const Header = packed struct {
     len: u32,
 };
 
-pub const Resize = packed struct {
-    rows: u16,
-    cols: u16,
-    xpixel: u16 = 0,
-    ypixel: u16 = 0,
-};
+pub const Resize = resize.Size;
 
 pub fn getTerminalSize(fd: i32) Resize {
-    var ws: cross.c.struct_winsize = undefined;
-    if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
-    }
-    return .{ .rows = 24, .cols = 120 };
+    return pty_posix.getTerminalSize(fd);
 }
 
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
+/// A peer may stream a frame in arbitrarily small writes, but a daemon must
+/// not grow a receive buffer without bound when the length field is hostile.
+/// This is large enough for large file-transfer messages while keeping
+/// malformed peers bounded. Write handling below streams the file into
+/// bounded PTY commands rather than creating an unbounded command buffer.
+pub const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
 
 /// Frozen wire shape. Do NOT add fields! New stats go in new `Tag` values
 /// so old daemons (whose `_` arm ignores unknown tags) stay reachable.
@@ -74,14 +73,24 @@ pub const Info = extern struct {
 };
 
 pub fn expectedLength(data: []const u8) ?usize {
+    return expectedLengthChecked(data) catch null;
+}
+
+pub const FrameError = error{FrameTooLarge};
+
+pub fn expectedLengthChecked(data: []const u8) FrameError!?usize {
     if (data.len < @sizeOf(Header)) return null;
     const header = std.mem.bytesToValue(Header, data[0..@sizeOf(Header)]);
+    if (@as(usize, header.len) > MAX_FRAME_LEN) return error.FrameTooLarge;
     // header.len comes off the wire; widen to usize before adding so a
     // near-u32-max value can't wrap (panic in safe mode, UB in release).
     return @as(usize, @sizeOf(Header)) + @as(usize, header.len);
 }
 
 pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
+    if (data.len > MAX_FRAME_LEN or data.len > std.math.maxInt(u32)) {
+        return error.FrameTooLarge;
+    }
     const header = Header{
         .tag = tag,
         .len = @intCast(data.len),
@@ -99,6 +108,9 @@ pub fn appendMessage(
     tag: Tag,
     data: []const u8,
 ) !void {
+    if (data.len > MAX_FRAME_LEN or data.len > std.math.maxInt(u32)) {
+        return error.FrameTooLarge;
+    }
     const header = Header{
         .tag = tag,
         .len = @intCast(data.len),
@@ -174,6 +186,10 @@ pub const SocketBuffer = struct {
         const n = try lib_posix.read(fd, &tmp);
         if (n > 0) {
             try self.buf.appendSlice(self.alloc, tmp[0..n]);
+            // Check as soon as the complete header is available. This keeps
+            // an oversized frame from being accumulated until allocation or
+            // peer timeout becomes the failure mode.
+            _ = expectedLengthChecked(self.buf.items[self.head..]) catch |err| return err;
         }
         return n;
     }
@@ -182,8 +198,12 @@ pub const SocketBuffer = struct {
     /// `buf` is advanced automatically; caller keeps the returned slices
     /// valid until the following `next()` (or `deinit`).
     pub fn next(self: *SocketBuffer) ?SocketMsg {
+        return self.nextChecked() catch null;
+    }
+
+    pub fn nextChecked(self: *SocketBuffer) FrameError!?SocketMsg {
         const available = self.buf.items[self.head..];
-        const total = expectedLength(available) orelse return null;
+        const total = try expectedLengthChecked(available) orelse return null;
         if (available.len < total) return null;
 
         const hdr = std.mem.bytesToValue(Header, available[0..@sizeOf(Header)]);
@@ -239,7 +259,7 @@ pub fn probeSession(
     send(fd, .LabelGet, "") catch {};
 
     var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    const poll_result = events_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) {
         return error.Timeout;
     }
@@ -269,7 +289,7 @@ pub fn probeSession(
         }
 
         // No complete message available, wait for more data
-        const more = lib_posix.poll(&poll_fds, 50) catch break;
+        const more = events_posix.poll(&poll_fds, 50) catch break;
         if (more == 0) break;
         const n_read = sb.read(fd) catch break;
         if (n_read == 0) break;
@@ -325,7 +345,7 @@ pub fn roundTripForTag(
     send(fd, request_tag, payload) catch return error.Unexpected;
 
     var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    const poll_result = events_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) return error.Timeout;
 
     var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
@@ -351,4 +371,37 @@ test "zeroed Info has no stack garbage in wire bytes" {
     // Tail padding after task_exit_code must be zero (asBytes ships it).
     const last_field_end = @offsetOf(Info, "task_exit_code") + @sizeOf(u8);
     for (bytes[last_field_end..]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "oversized frame lengths are rejected before allocation" {
+    var header = Header{ .tag = .Output, .len = @intCast(MAX_FRAME_LEN + 1) };
+    try std.testing.expectError(error.FrameTooLarge, expectedLengthChecked(std.mem.asBytes(&header)));
+}
+
+test "SocketBuffer preserves partial frames and rejects oversized headers" {
+    var buffer = try SocketBuffer.init(std.testing.allocator);
+    defer buffer.deinit();
+
+    var header = Header{ .tag = .Output, .len = @intCast(MAX_FRAME_LEN + 1) };
+    try buffer.buf.appendSlice(buffer.alloc, std.mem.asBytes(&header));
+    try std.testing.expectError(error.FrameTooLarge, buffer.nextChecked());
+}
+
+test "large Write frames remain bounded and round-trip above 64 MiB" {
+    const payload_len = 64 * 1024 * 1024 + 1;
+    const payload = try std.testing.allocator.alloc(u8, payload_len);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0x5a);
+
+    var buffer = try SocketBuffer.init(std.testing.allocator);
+    defer buffer.deinit();
+    try buffer.buf.ensureTotalCapacity(buffer.alloc, @sizeOf(Header) + payload.len);
+    const header = Header{ .tag = .Write, .len = @intCast(payload.len) };
+    buffer.buf.appendSliceAssumeCapacity(std.mem.asBytes(&header));
+    buffer.buf.appendSliceAssumeCapacity(payload);
+
+    const message = (try buffer.nextChecked()).?;
+    try std.testing.expectEqual(Tag.Write, message.header.tag);
+    try std.testing.expectEqual(payload.len, message.payload.len);
+    try std.testing.expectEqual(@as(u8, 0x5a), message.payload[message.payload.len - 1]);
 }

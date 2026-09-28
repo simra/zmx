@@ -1,43 +1,21 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
-const Cfg = @import("cfg.zig");
+const Cfg = @import("cfg.zig").Cfg;
 const socket = @import("socket.zig");
 const ipc = @import("ipc.zig");
 const assert = std.debug.assert;
 const log = @import("log.zig");
 const cross = @import("cross.zig");
+const platform_shell = @import("platform/shell.zig");
+const pty_posix = @import("platform/pty_posix.zig");
+const pty = @import("platform/pty.zig");
+const pty_runtime = @import("platform/pty_runtime.zig");
+const builtin = @import("builtin");
 
-const Cmd = struct {
-    file: [*:0]const u8,
-    argv_ptr: [*:null]const ?[*:0]const u8,
-};
+const Cmd = platform_shell.Cmd;
 
 pub fn createCmdZ(def_shell: []const u8, is_task_mode: bool, command: ?[]const []const u8) !Cmd {
-    const gpa = std.heap.c_allocator;
-
-    if (command) |cmd_args| {
-        const argv = try gpa.allocSentinel(?[*:0]const u8, cmd_args.len, null);
-        for (cmd_args, 0..) |arg, i| {
-            argv[i] = try gpa.dupeZ(u8, arg);
-        }
-        return .{
-            .file = argv[0].?,
-            .argv_ptr = argv.ptr,
-        };
-    }
-
-    const z = try std.fmt.allocPrintSentinel(gpa, "{s}", .{def_shell}, 0);
-    const shell: [:0]const u8 = if (is_task_mode) "bash" else z;
-
-    // Use "-shellname" as argv[0] to signal login shell (traditional method)
-    const login_shell = try std.fmt.allocPrintSentinel(gpa, "-{s}", .{std.fs.path.basename(shell)}, 0);
-    const argv = try gpa.allocSentinel(?[*:0]const u8, 1, null);
-    argv[0] = login_shell.ptr;
-
-    return .{
-        .file = shell,
-        .argv_ptr = argv,
-    };
+    return platform_shell.createCmdZ(def_shell, is_task_mode, command);
 }
 
 /// Runs in the forked child. Either execs or returns an error (caller
@@ -63,35 +41,39 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
     );
     _ = cross.c.putenv(session_env.ptr);
 
+    if (cross.c.getenv("TERM")) |term_env| {
+        if (std.mem.eql(u8, std.mem.span(term_env), "dumb")) {
+            _ = cross.c.putenv(@constCast("TERM=xterm-256color"));
+        }
+    } else {
+        _ = cross.c.putenv(@constCast("TERM=xterm-256color"));
+    }
+
     const err = lib_posix.execvpeZ(cmd.file, cmd.argv_ptr, std.c.environ);
     std.log.err("execvpe failed: cmd={s} err={s}", .{ cmd.file, @errorName(err) });
     lib_posix.exit(1);
 }
 
-pub const PtyInfo = struct {
-    master_fd: c_int = undefined,
-    pid: c_int = undefined,
-};
+pub const PtyInfo = if (builtin.os.tag == .windows) pty.Spawned else pty_posix.Info;
 
 /// spawnPty runs forkpty() and executes the shell or shell command the user
 /// provides.
 ///
 /// This is the second fork in the double-fork technique explained in the
 /// daemonize() comment.
-pub fn spawnPty(sesh_name: []const u8, cmd: Cmd) !PtyInfo {
-    const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-    var ws: cross.c.struct_winsize = .{
-        .ws_row = size.rows,
-        .ws_col = size.cols,
-        .ws_xpixel = size.xpixel,
-        .ws_ypixel = size.ypixel,
-    };
-
-    var master_fd: c_int = undefined;
-    const pid = cross.forkpty(&master_fd, null, null, &ws);
-    if (pid < 0) {
-        return error.ForkPtyFailed;
+pub fn spawnPty(
+    sesh_name: []const u8,
+    cmd: Cmd,
+    size: ipc.Resize,
+    runtime: *pty_runtime.Runtime,
+    spawn_spec: pty.SpawnSpec,
+) !PtyInfo {
+    if (builtin.os.tag == .windows) {
+        return runtime.spawn(spawn_spec);
     }
+    const forked = try pty_posix.forkPty(size);
+    const master_fd = forked.master_fd;
+    const pid = forked.pid;
 
     if (pid == 0) { // child pid code path
         // In the forked child, ANY error must exit rather than propagate:
@@ -160,7 +142,16 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd) !PtyInfo {
 ///                 ✝          │ PID≠SID → can't get a tty
 ///                            ▼
 ///                          DAEMON ✓
-pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo {
+pub fn daemonize(
+    sesh_name: []const u8,
+    cmd: Cmd,
+    keep_fds_open: []i32,
+    runtime: *pty_runtime.Runtime,
+    spawn_spec: pty.SpawnSpec,
+) !PtyInfo {
+    if (builtin.os.tag == .windows) {
+        return runtime.spawn(spawn_spec);
+    }
     // creates the daemon
     const pid = try lib_posix.fork();
     assert(pid != -1);
@@ -178,6 +169,9 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
     assert(pid == 0); // child (daemon's parent in double-fork)
     // becomes the session leader and detaches process from its controlling terminal
     _ = try lib_posix.setsid();
+
+    // Fetch terminal size before redirecting stdio FDs to /dev/null.
+    const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
 
     // Redirect stdin/stdout/stderr to /dev/null. The daemon
     // communicates via its unix socket, not stdio. Without
@@ -225,5 +219,5 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
         }
     }
 
-    return spawnPty(sesh_name, cmd);
+    return spawnPty(sesh_name, cmd, term_size, runtime, spawn_spec);
 }
