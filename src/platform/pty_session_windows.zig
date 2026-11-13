@@ -175,6 +175,7 @@ const Client = struct {
     closed: std.atomic.Value(bool) = .init(false),
     connection_closed: std.atomic.Value(bool) = .init(false),
     foreground: std.atomic.Value(bool) = .init(false),
+    history_subscribed: bool = false,
     foreground_history_pending: std.atomic.Value(bool) = .init(false),
     foreground_history_ready: std.atomic.Value(bool) = .init(false),
     task_complete_sent: std.atomic.Value(bool) = .init(false),
@@ -452,6 +453,8 @@ fn sessionMain(session: *Session) void {
             null,
         ) catch |err| switch (err) {
             error.Timeout => continue,
+            // A peer can disconnect before its pending connection is accepted.
+            error.BrokenPipe, error.ConnectionResetByPeer => continue,
             error.AlreadyClosed => break,
             else => {
                 session.alive.store(false, .release);
@@ -615,13 +618,7 @@ fn readerMain(session: *Session) void {
             else => break,
         };
         if (amount == 0) break;
-        session.lock();
-        session.lockTerminal();
-        session.vt_stream.nextSlice(buffer[0..amount]);
-        recordHistoryLocked(session, buffer[0..amount]);
-        session.unlockTerminal();
-        session.unlock();
-        broadcast(session, .Output, buffer[0..amount]);
+        publishOutput(session, buffer[0..amount]);
     }
 
     if (session.spec.task_mode and session.alive.load(.acquire)) {
@@ -656,52 +653,30 @@ fn recordHistoryLocked(session: *Session, payload: []const u8) void {
     session.history.appendSlice(session.alloc, payload) catch {};
 }
 
-fn broadcast(session: *Session, tag: wire.Tag, payload: []const u8) void {
-    var clients: std.ArrayList(*Client) = .empty;
+fn publishOutput(session: *Session, payload: []const u8) void {
+    // Recording, snapshot subscription, and live enqueue share one boundary:
+    // a byte belongs to either the snapshot or live output, never both.
     session.lock();
-    for (session.clients.items) |client| {
-        if (client.closed.load(.acquire)) continue;
-        if (tag == .Output and
-            (!client.foreground.load(.acquire) or
-                client.foreground_history_pending.load(.acquire)))
-        {
-            continue;
-        }
-        _ = client.broadcast_refs.fetchAdd(1, .acq_rel);
-        clients.append(session.alloc, client) catch {
-            _ = client.broadcast_refs.fetchSub(1, .acq_rel);
-            for (clients.items) |held| {
-                _ = held.broadcast_refs.fetchSub(1, .acq_rel);
-            }
-            clients.deinit(session.alloc);
-            session.unlock();
-            return;
-        };
-    }
-    session.unlock();
-    defer {
-        for (clients.items) |client| {
-            _ = client.broadcast_refs.fetchSub(1, .acq_rel);
-        }
-        clients.deinit(session.alloc);
-    }
+    defer session.unlock();
+    session.lockTerminal();
+    session.vt_stream.nextSlice(payload);
+    recordHistoryLocked(session, payload);
+    session.unlockTerminal();
+
     const max_payload = Client.max_output_bytes - @sizeOf(wire.Header);
     var offset: usize = 0;
     while (offset < payload.len or (payload.len == 0 and offset == 0)) {
         const amount = @min(payload.len -| offset, max_payload);
         const chunk = payload[offset .. offset + amount];
-        for (clients.items) |client| {
+        for (session.clients.items) |client| {
             if (client.closed.load(.acquire)) continue;
-            switch (tag) {
-                .Output => {
-                    // PTY output must never wait behind a slow reader.  The
-                    // bounded enqueue either succeeds immediately or ejects
-                    // the client before the next reader chunk is processed.
-                    client.enqueue(.Output, chunk) catch client.eject();
-                },
-                .TaskComplete => client.enqueueTaskComplete(chunk) catch client.eject(),
-                else => client.enqueue(tag, chunk) catch client.eject(),
+            if ((!client.foreground.load(.acquire) and !client.history_subscribed) or
+                client.foreground_history_pending.load(.acquire))
+            {
+                continue;
             }
+            // Never wait for a slow observer while holding session state.
+            client.enqueue(.Output, chunk) catch client.eject();
         }
         if (payload.len == 0) break;
         offset += amount;
@@ -1233,6 +1208,7 @@ fn timerGenerationForInput(
 fn pinReplacementLocked(session: *Session, departing: *Client) ?*Client {
     for (session.clients.items) |other| {
         if (other == departing or other.closed.load(.acquire)) continue;
+        if (!other.foreground.load(.acquire)) continue;
         _ = other.broadcast_refs.fetchAdd(1, .acq_rel);
         return other;
     }
@@ -1374,13 +1350,7 @@ fn clientMain(client: *Client) void {
                 writePty(session, frame.payload);
             },
             .Output => {
-                session.lock();
-                session.lockTerminal();
-                session.vt_stream.nextSlice(frame.payload);
-                recordHistoryLocked(session, frame.payload);
-                session.unlockTerminal();
-                session.unlock();
-                broadcast(session, .Output, frame.payload);
+                publishOutput(session, frame.payload);
             },
             .Resize => {
                 if (frame.payload.len != @sizeOf(wire.Resize)) {
@@ -1601,6 +1571,16 @@ fn sendTaskComplete(client: *Client) void {
 
 fn sendHistory(client: *Client, request: []const u8, blocking: bool) void {
     const session = client.session;
+    if (request.len == 0) {
+        session.lock();
+        defer session.unlock();
+        // The retained snapshot, including its terminator, fits the bounded
+        // queue. Do not block under the session lock or promote this client.
+        if (enqueueHistoryFrames(client, session.history.items, false)) {
+            client.history_subscribed = true;
+        }
+        return;
+    }
     const format: u8 = if (request.len == 0) 0 else request[0];
     session.lock();
     const history = session.alloc.dupe(u8, session.history.items) catch {
@@ -2190,7 +2170,7 @@ test "Windows foreground history cursor precedes later live output" {
 
     sendForegroundHistory(&client, false);
     try std.testing.expect(client.foreground_history_ready.load(.acquire));
-    broadcast(&session, .Output, "new");
+    publishOutput(&session, "new");
 
     var offset: usize = 0;
     var frame_count: usize = 0;
@@ -2208,6 +2188,152 @@ test "Windows foreground history cursor precedes later live output" {
     }
     try std.testing.expect(frame_count >= 2);
     try std.testing.expectEqualStrings("new", last_payload);
+}
+
+const OutputTestFixture = struct {
+    session: Session = undefined,
+    clients: [4]Client = undefined,
+
+    fn init(self: *OutputTestFixture) !void {
+        const alloc = std.testing.allocator;
+        self.session = .{
+            .alloc = alloc,
+            .spec = .{ .alloc = alloc, .io = std.testing.io, .session_name = "output-test", .shell = "cmd.exe" },
+            .server = undefined,
+            .runtime = undefined,
+            .master = undefined,
+            .process = undefined,
+            .terminal = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 }),
+            .vt_stream = undefined,
+        };
+        errdefer self.session.terminal.deinit(alloc);
+        self.session.vt_stream = self.session.terminal.vtStream();
+        errdefer self.session.vt_stream.deinit();
+        try self.session.clients.ensureTotalCapacity(alloc, self.clients.len);
+        for (&self.clients) |*client| {
+            client.* = .{
+                .session = &self.session,
+                .connection = .{ .handle = 0, .close_fn = testConnectionClose },
+                .input = input_classifier.InputClassifier.init(alloc),
+            };
+            self.session.clients.appendAssumeCapacity(client);
+        }
+    }
+
+    fn deinit(self: *OutputTestFixture) void {
+        for (&self.clients) |*client| {
+            client.output.deinit(std.testing.allocator);
+            client.input.deinit();
+        }
+        self.session.clients.deinit(std.testing.allocator);
+        self.session.history.deinit(std.testing.allocator);
+        self.session.vt_stream.deinit();
+        self.session.terminal.deinit(std.testing.allocator);
+    }
+};
+
+fn expectQueuedFrames(client: *Client, tags: []const wire.Tag, payloads: []const []const u8) !void {
+    var offset: usize = 0;
+    for (tags, payloads) |tag, payload| {
+        try std.testing.expect(offset + @sizeOf(wire.Header) <= client.output.items.len);
+        const header = std.mem.bytesToValue(wire.Header, client.output.items[offset..][0..@sizeOf(wire.Header)]);
+        try std.testing.expectEqual(tag, header.tag);
+        offset += @sizeOf(wire.Header);
+        try std.testing.expectEqualStrings(payload, client.output.items[offset..][0..header.len]);
+        offset += header.len;
+    }
+    try std.testing.expectEqual(client.output.items.len, offset);
+}
+
+test "Windows history subscribers coexist without ownership and never replace the owner" {
+    var fixture: OutputTestFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const session = &fixture.session;
+    const owner = &fixture.clients[0];
+    owner.foreground.store(true, .release);
+    session.leader = owner;
+    session.leader_generation = 42;
+    publishOutput(session, "old");
+    for (fixture.clients[1..3]) |*client| sendHistory(client, &.{}, false);
+    sendHistory(&fixture.clients[3], &.{1}, false);
+    publishOutput(session, "live");
+
+    try expectQueuedFrames(owner, &.{ .Output, .Output }, &.{ "old", "live" });
+    for (fixture.clients[1..3]) |*client| {
+        try expectQueuedFrames(client, &.{ .History, .History, .Output }, &.{ "old", "", "live" });
+        try std.testing.expect(!client.foreground.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), client.cwd_input.items.len);
+    }
+    try expectQueuedFrames(&fixture.clients[3], &.{ .History, .History }, &.{ "old", "" });
+    try std.testing.expect(session.leader == owner);
+    try std.testing.expectEqual(@as(u64, 42), session.leader_generation);
+
+    fixture.clients[1].closed.store(true, .release);
+    releaseLeader(session, &fixture.clients[1]);
+    try std.testing.expect(session.leader == owner);
+    try std.testing.expectEqual(@as(u64, 42), session.leader_generation);
+    owner.closed.store(true, .release);
+    releaseLeader(session, owner);
+    try std.testing.expect(session.leader == null);
+    try std.testing.expectEqual(@as(u64, 43), session.leader_generation);
+    publishOutput(session, "later");
+    try expectQueuedFrames(&fixture.clients[2], &.{ .History, .History, .Output, .Output }, &.{ "old", "", "live", "later" });
+    try expectQueuedFrames(&fixture.clients[1], &.{ .History, .History, .Output }, &.{ "old", "", "live" });
+}
+
+const SubscriptionRace = struct {
+    session: *Session,
+    start: std.atomic.Value(bool) = .init(false),
+
+    fn publish(self: *SubscriptionRace) void {
+        while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+        for (0..256) |_| publishOutput(self.session, "live\r\n");
+    }
+};
+
+test "Windows history subscription cutover has no missing or duplicated output" {
+    var fixture: OutputTestFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    publishOutput(&fixture.session, "snapshot\r\n");
+    var race: SubscriptionRace = .{ .session = &fixture.session };
+    const thread = try std.Thread.spawn(.{}, SubscriptionRace.publish, .{&race});
+    race.start.store(true, .release);
+    sendHistory(&fixture.clients[1], &.{}, false);
+    thread.join();
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(std.testing.allocator);
+    var offset: usize = 0;
+    var terminators: usize = 0;
+    const frames = fixture.clients[1].output.items;
+    while (offset < frames.len) {
+        const header = std.mem.bytesToValue(wire.Header, frames[offset..][0..@sizeOf(wire.Header)]);
+        offset += @sizeOf(wire.Header);
+        if (header.tag == .History and header.len == 0) terminators += 1;
+        if (header.tag == .Output) try std.testing.expectEqual(@as(usize, 1), terminators);
+        try received.appendSlice(std.testing.allocator, frames[offset..][0..header.len]);
+        offset += header.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), terminators);
+    try std.testing.expectEqualStrings(fixture.session.history.items, received.items);
+    try std.testing.expect(fixture.session.leader == null);
+    try std.testing.expectEqual(@as(u64, 0), fixture.session.leader_generation);
+}
+
+test "Windows slow history subscriber cannot block or eject another client" {
+    var fixture: OutputTestFixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const slow = &fixture.clients[1];
+    const fast = &fixture.clients[2];
+    sendHistory(slow, &.{}, false);
+    sendHistory(fast, &.{}, false);
+    try slow.output.resize(std.testing.allocator, Client.max_output_bytes);
+    publishOutput(&fixture.session, "live");
+    try std.testing.expect(slow.closed.load(.acquire));
+    try std.testing.expect(!fast.closed.load(.acquire));
+    try expectQueuedFrames(fast, &.{ .History, .Output }, &.{ "", "live" });
 }
 
 test "Windows fragmented input updates session cwd at line termination" {
@@ -2377,6 +2503,7 @@ test "Windows replacement pin survives reap check until resize enqueue completes
     departing.broadcast_refs = .init(0);
     var replacement: Client = undefined;
     replacement.closed = .init(false);
+    replacement.foreground = .init(true);
     replacement.broadcast_refs = .init(0);
     try session.clients.append(std.testing.allocator, &departing);
     try session.clients.append(std.testing.allocator, &replacement);

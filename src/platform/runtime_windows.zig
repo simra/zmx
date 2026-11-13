@@ -427,16 +427,7 @@ fn createSecuredChildBoundToRoot(
 }
 
 fn ensureConfiguredRoot(alloc: std.mem.Allocator, path: []const u8) Error!void {
-    const path_w = try utf16Path(alloc, path);
-    defer alloc.free(path_w);
-    var created = true;
-    if (CreateDirectoryW(path_w.ptr, null) == 0) {
-        if (windows.GetLastError() != .ALREADY_EXISTS) return error.AccessDenied;
-        created = false;
-    }
-    if (created) {
-        try setOwnerToCurrent(alloc, path);
-    }
+    try createDirectoryWithFilesystemSecurity(alloc, path);
     // Check after CreateDirectoryW: an existing path, or a path replaced by a
     // reparse point during startup, must never be used for private children.
     var guard = try openRootGuard(alloc, path);
@@ -616,7 +607,7 @@ fn verifyFilesystemSecurity(
     if (!saw_user or !saw_system) return error.AccessDenied;
 }
 
-fn ensureSecureDirectory(
+fn createDirectoryWithFilesystemSecurity(
     alloc: std.mem.Allocator,
     path: []const u8,
 ) Error!void {
@@ -646,6 +637,13 @@ fn ensureSecureDirectory(
     if (CreateDirectoryW(path_w.ptr, &attributes) == 0) {
         if (windows.GetLastError() != .ALREADY_EXISTS) return error.AccessDenied;
     }
+}
+
+fn ensureSecureDirectory(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+) Error!void {
+    try createDirectoryWithFilesystemSecurity(alloc, path);
     try rejectReparsePoint(alloc, path);
     return verifyFilesystemSecurity(alloc, path);
 }
@@ -1598,7 +1596,32 @@ test "Windows explicit ZMX_DIR isolates rendezvous and log roots" {
     );
 }
 
-test "Windows configured root may use inherited ACLs while children are secured" {
+fn testFilesystemDacl(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    const path_w = try utf16Path(alloc, path);
+    defer alloc.free(path_w);
+    var dacl: ?*anyopaque = null;
+    var descriptor: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(windows.DWORD, 0), GetNamedSecurityInfoW(
+        path_w.ptr,
+        se_file_object,
+        dacl_security_information,
+        null,
+        null,
+        &dacl,
+        null,
+        &descriptor,
+    ));
+    defer _ = LocalFree(descriptor);
+    var control: windows.WORD = 0;
+    var revision: windows.DWORD = 0;
+    try std.testing.expect(GetSecurityDescriptorControl(descriptor.?, &control, &revision) != 0);
+    var info: AclSizeInformation = undefined;
+    try std.testing.expect(GetAclInformation(dacl.?, &info, @sizeOf(AclSizeInformation), acl_information_basic) != 0);
+    const bytes: [*]const u8 = @ptrCast(dacl.?);
+    return std.mem.concat(alloc, u8, &.{ std.mem.asBytes(&control), bytes[0..info.acl_bytes_in_use] });
+}
+
+test "Windows existing configured root DACL is unchanged while children are secured" {
     const alloc = std.testing.allocator;
     const base = try filesystemBase(alloc);
     defer alloc.free(base);
@@ -1613,8 +1636,32 @@ test "Windows configured root may use inherited ACLs while children are secured"
     std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
     std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
     std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
-    try std.Io.Dir.createDirAbsolute(std.testing.io, root, .default_dir);
-    try setOwnerToCurrent(alloc, root);
+    const root_w = try utf16Path(alloc, root);
+    defer alloc.free(root_w);
+    const sddl = try std.fmt.allocPrint(
+        alloc,
+        "O:{s}G:SYD:P(A;OICI;FA;;;{s})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+        .{ sid, sid },
+    );
+    defer alloc.free(sddl);
+    const sddl_w = try utf16Path(alloc, sddl);
+    defer alloc.free(sddl_w);
+    var descriptor: ?*anyopaque = null;
+    try std.testing.expect(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl_w.ptr,
+        security_descriptor_revision,
+        &descriptor,
+        null,
+    ) != 0);
+    defer _ = LocalFree(descriptor);
+    var attributes = windows.SECURITY_ATTRIBUTES{
+        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+        .lpSecurityDescriptor = descriptor,
+        .bInheritHandle = winBool(@TypeOf(@as(windows.SECURITY_ATTRIBUTES, undefined).bInheritHandle), false),
+    };
+    try std.testing.expect(CreateDirectoryW(root_w.ptr, &attributes) != 0);
+    const before = try testFilesystemDacl(alloc, root);
+    defer alloc.free(before);
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
@@ -1625,9 +1672,12 @@ test "Windows configured root may use inherited ACLs while children are secured"
         "inherited-acl",
         root,
     );
+    const after = try testFilesystemDacl(alloc, root);
+    defer alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
 }
 
-test "Windows missing configured root is created with inherited ACLs" {
+test "Windows missing configured root grants its owner access without inheritance" {
     const alloc = std.testing.allocator;
     const base = try filesystemBase(alloc);
     defer alloc.free(base);
@@ -1646,8 +1696,7 @@ test "Windows missing configured root is created with inherited ACLs" {
     std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
     std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
     std.Io.Dir.deleteDirAbsolute(std.testing.io, parent) catch {};
-    try std.Io.Dir.createDirAbsolute(std.testing.io, parent, .default_dir);
-    try setOwnerToCurrent(alloc, parent);
+    try ensureSecureDirectory(alloc, parent);
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, user_dir) catch {};
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, ipc_dir) catch {};
     defer std.Io.Dir.deleteDirAbsolute(std.testing.io, root) catch {};
@@ -1659,6 +1708,12 @@ test "Windows missing configured root is created with inherited ACLs" {
         "missing-root",
         root,
     );
+    try verifyFilesystemSecurity(alloc, root);
+    const probe = try std.fmt.allocPrint(alloc, "{s}\\owner-write", .{root});
+    defer alloc.free(probe);
+    const file = try std.Io.Dir.createFileAbsolute(std.testing.io, probe, .{});
+    file.close(std.testing.io);
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, probe);
 }
 
 test "Windows configured reparse root is rejected" {

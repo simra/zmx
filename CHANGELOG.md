@@ -4,6 +4,12 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
+### Fixed
+
+- Windows read-only output followers receive live output without becoming foreground clients or replacement terminal owners.
+- Windows session hosts survive clients disconnecting before their connection is accepted.
+- Newly created Windows `ZMX_DIR` roots grant access to the current user and SYSTEM without relying on inherited permissions. Existing roots keep their permissions.
+
 ## v0.7.0 - 2026-07-23
 
 ### Added
