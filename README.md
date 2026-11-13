@@ -121,6 +121,29 @@ Commands:
   [h]elp                                   Show this help
 ```
 
+## Windows read-only output following
+
+`zmx tail <exact-name>` reads retained output and follows new output without
+attaching, sending input, resizing the terminal, or taking ownership. Multiple
+followers can coexist with an attached owner and continue after that owner
+disconnects. A silent follower is not evidence that the task has completed.
+
+On Windows, this reuses the existing empty `History` request: the server queues
+the raw history snapshot and its empty terminator before subsequent `Output`
+frames. Explicit-format `History` requests used by `zmx history` remain
+snapshot-only. No wire tag or layout changes. Existing clients work with the
+patched server; an older Windows server can still miss live output, so recreate
+the session with the patched executable rather than falling back to attach.
+Disconnect/exit zero alone is not authoritative task-completion evidence.
+
+The bounded synthetic regression can be run with
+`python test\windows_readonly_tail.py --exe zig-out\bin\zmx.exe` on Windows
+(Python's executable path must not contain spaces with the current task launcher).
+It creates only uniquely named test sessions in an isolated `ZMX_DIR`; it never
+uses an existing terminal. Add `--expect-missed-live` when reproducing the
+pre-subscription-fix server. The test retains the new host's exact process handle;
+add `--detached-launcher` to also exercise `zmx run <name> -d` startup.
+
 ## shell prompt
 
 When you attach to a `zmx` session, we don't provide any indication that you are inside `zmx`. We do provide an environment variable `ZMX_SESSION` which contains the session name.
